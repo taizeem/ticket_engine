@@ -27,12 +27,16 @@ ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "").split(",")
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',
+    
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+
+    'channels',
 
     'tickets',
 ]
@@ -65,7 +69,7 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = "config.asgi.application"
 
 
 # Database
@@ -159,3 +163,14 @@ CELERY_IMPORTS = [
     "tickets.tasks.expiration_tasks",
     "tickets.tasks.turnstile_tasks",
 ]
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [os.environ.get("CHANNEL_LAYERS_REDIS_URL", "redis://127.0.0.1:6379/3")],
+            "capacity": 1500,  # Max messages held per channel group to prevent RAM leaks
+            "expiry": 10,      # Seconds before unconsumed messages expire
+        },
+    },
+}
