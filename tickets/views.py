@@ -228,12 +228,10 @@ class PoWChallengeView(View):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class EnterWaitingRoomView(View):
-    """
-    Ingress Gate: Enforces Circuit Breaker, Proof-of-Work, then Token Bucket.
-    """
+    """Ingress Gate: Enforces Circuit Breaker, Proof-of-Work, then Token Bucket."""
 
     def post(self, request: HttpRequest, event_id: int) -> HttpResponse:
-        # Edge Guard 1: Sold-Out Circuit Breaker Check
+        # 1. Edge Guard: Sold-Out Circuit Breaker Check
         inv_mgr = InventoryManager(event_id=event_id)
         if inv_mgr.is_sold_out():
             return JsonResponse(
@@ -247,21 +245,22 @@ class EnterWaitingRoomView(View):
             if not user_id:
                 raise ValueError("user_id cannot be blank.")
 
-            # Extract PoW challenge verification parameters
             pow_data = payload.get("pow")
             if not pow_data:
-                return JsonResponse({"error": "Missing Proof-of-Work solution ('pow' object)."}, status=403)
+                return JsonResponse(
+                    {"error": "Missing Proof-of-Work solution ('pow' object)."},
+                    status=403,
+                )
 
             nonce = str(pow_data["nonce"])
             difficulty = int(pow_data["difficulty"])
             timestamp = int(pow_data["timestamp"])
             signature = str(pow_data["signature"])
             solution = int(pow_data["solution"])
-
         except (KeyError, ValueError, json.JSONDecodeError) as e:
             return JsonResponse({"error": f"Invalid payload: {str(e)}"}, status=400)
 
-        # Edge Guard 2: Asymmetric Proof-of-Work Verification (< 0.05ms)
+        # 2. Asymmetric Proof-of-Work Verification
         is_valid_pow, reason = verify_pow_solution(
             event_id=event_id,
             user_id=user_id,
@@ -274,9 +273,8 @@ class EnterWaitingRoomView(View):
         if not is_valid_pow:
             return JsonResponse({"error": f"Proof-of-Work failed: {reason}"}, status=403)
 
-        # Edge Guard 3: Attempt token bucket consumption
-        is_allowed, remaining_tokens = global_token_bucket.consume(event_id=event_id)
-
+        # 3. Token Bucket Fast-Path Evaluation
+        is_allowed, _ = global_token_bucket.consume(event_id=event_id)
         if is_allowed:
             admission_pass = generate_admission_pass(
                 event_id=event_id,
@@ -292,9 +290,9 @@ class EnterWaitingRoomView(View):
                 status=200,
             )
 
-        # Edge Guard 4: Enqueue into Redis ZSET
+        # 4. Fallback: Enqueue into Redis ZSET Waiting Room
         waiting_room = VirtualWaitingRoom(event_id=event_id)
-        queue_position, is_new = waiting_room.enqueue(user_id=user_id)
+        queue_position, _ = waiting_room.enqueue(user_id=user_id)
         total_waiting = waiting_room.get_queue_size()
 
         return JsonResponse(
@@ -306,7 +304,6 @@ class EnterWaitingRoomView(View):
             },
             status=202,
         )
-
 @method_decorator(csrf_exempt, name="dispatch")
 class EventAvailabilityView(View):
     """
