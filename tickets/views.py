@@ -11,6 +11,8 @@ from tickets.exceptions import InsufficientSeatsAvailable, EventNotActive, Reser
 from tickets.waiting_room.token_bucket import RedisTokenBucket
 from tickets.waiting_room.queue_manager import VirtualWaitingRoom
 from tickets.waiting_room.admission import generate_admission_pass, verify_admission_pass
+from tickets.waiting_room.inventory import InventoryManager
+from tickets.waiting_room.pow import generate_pow_challenge, verify_pow_solution
 
 # Global bucket instance: 100 req/sec steady rate with 200 burst capacity
 global_token_bucket = RedisTokenBucket(refill_rate=100.0, capacity=200)
@@ -204,4 +206,105 @@ class ConfirmReservationView(View):
                 "tickets": confirmed_seats,
             },
             status=200 if not is_newly_confirmed else 201,
+        )
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PoWChallengeView(View):
+    """
+    Issues dynamic, signed Proof-of-Work challenges to incoming clients.
+    """
+
+    def get(self, request: HttpRequest, event_id: int) -> HttpResponse:
+        user_id = request.GET.get("user_id", "").strip()
+        if not user_id:
+            return JsonResponse({"error": "Missing user_id query parameter."}, status=400)
+
+        challenge = generate_pow_challenge(
+            event_id=event_id,
+            user_id=user_id,
+            difficulty=4,  # 4 hex chars = 16 bits = ~65,536 trials (~40ms)
+            ttl_seconds=60,
+        )
+        return JsonResponse(challenge, status=200)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class EnterWaitingRoomView(View):
+    """
+    Ingress Gate: Enforces Circuit Breaker, Proof-of-Work, then Token Bucket.
+    """
+
+    def post(self, request: HttpRequest, event_id: int) -> HttpResponse:
+        # Edge Guard 1: Sold-Out Circuit Breaker Check
+        inv_mgr = InventoryManager(event_id=event_id)
+        if inv_mgr.is_sold_out():
+            return JsonResponse(
+                {"error": "Event is completely sold out.", "status": "SOLD_OUT"},
+                status=410,
+            )
+
+        try:
+            payload = json.loads(request.body.decode("utf-8"))
+            user_id = str(payload["user_id"]).strip()
+            if not user_id:
+                raise ValueError("user_id cannot be blank.")
+
+            # Extract PoW challenge verification parameters
+            pow_data = payload.get("pow")
+            if not pow_data:
+                return JsonResponse({"error": "Missing Proof-of-Work solution ('pow' object)."}, status=403)
+
+            nonce = str(pow_data["nonce"])
+            difficulty = int(pow_data["difficulty"])
+            timestamp = int(pow_data["timestamp"])
+            signature = str(pow_data["signature"])
+            solution = int(pow_data["solution"])
+
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            return JsonResponse({"error": f"Invalid payload: {str(e)}"}, status=400)
+
+        # Edge Guard 2: Asymmetric Proof-of-Work Verification (< 0.05ms)
+        is_valid_pow, reason = verify_pow_solution(
+            event_id=event_id,
+            user_id=user_id,
+            nonce=nonce,
+            difficulty=difficulty,
+            timestamp=timestamp,
+            signature=signature,
+            solution=solution,
+        )
+        if not is_valid_pow:
+            return JsonResponse({"error": f"Proof-of-Work failed: {reason}"}, status=403)
+
+        # Edge Guard 3: Attempt token bucket consumption
+        is_allowed, remaining_tokens = global_token_bucket.consume(event_id=event_id)
+
+        if is_allowed:
+            admission_pass = generate_admission_pass(
+                event_id=event_id,
+                user_id=user_id,
+                ttl_seconds=60,
+            )
+            return JsonResponse(
+                {
+                    "status": "ADMITTED",
+                    "admission_pass": admission_pass,
+                    "expires_in_seconds": 60,
+                },
+                status=200,
+            )
+
+        # Edge Guard 4: Enqueue into Redis ZSET
+        waiting_room = VirtualWaitingRoom(event_id=event_id)
+        queue_position, is_new = waiting_room.enqueue(user_id=user_id)
+        total_waiting = waiting_room.get_queue_size()
+
+        return JsonResponse(
+            {
+                "status": "QUEUED",
+                "queue_position": queue_position,
+                "total_waiting": total_waiting,
+                "channel_id": f"event_{event_id}_user_{user_id}",
+            },
+            status=202,
         )
