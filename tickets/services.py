@@ -12,6 +12,7 @@ from tickets.exceptions import (
     ReservationAlreadyProcessedError,
     InvalidPaymentAmountError,
 )
+from tickets.waiting_room.inventory import InventoryManager
 
 
 def allocate_seats_orm(
@@ -246,3 +247,145 @@ def confirm_reservation_payment(
         )
 
     return reservation, True
+
+
+
+
+def allocate_seats_contiguous(
+    event_id: int,
+    user_id: str,
+    quantity: int,
+    hold_duration_seconds: int = 600,
+    section: Optional[str] = None,
+    allow_scattered_fallback: bool = True,
+) -> Reservation:
+    """
+    Allocates contiguous adjacent seats within the same section and row.
+    Uses PostgreSQL LEAD() window function to find consecutive seat_number runs.
+    Falls back to scattered seat allocation if adjacent blocks are exhausted and fallback is enabled.
+    """
+    if quantity <= 0:
+        raise ValueError("Allocation quantity must be greater than zero.")
+
+    # 1-seat requests are inherently contiguous
+    if quantity == 1:
+        return allocate_seats_orm(
+            event_id=event_id,
+            user_id=user_id,
+            quantity=1,
+            hold_duration_seconds=hold_duration_seconds,
+            section=section,
+        )
+
+    now = timezone.now()
+    expires_at = now + timedelta(seconds=hold_duration_seconds)
+
+    contiguous_query = """
+    WITH available_seats AS (
+        SELECT 
+            id,
+            section,
+            row,
+            seat_number,
+            LEAD(seat_number, %s - 1) OVER (
+                PARTITION BY section, row 
+                ORDER BY seat_number
+            ) AS end_seat
+        FROM ticket_seats
+        WHERE event_id = %s
+          AND (
+              status = 'AVAILABLE' 
+              OR (status = 'HELD' AND held_until < %s)
+          )
+          {section_filter}
+    ),
+    matched_run AS (
+        SELECT section, row, seat_number AS start_seat, end_seat
+        FROM available_seats
+        WHERE end_seat IS NOT NULL
+          AND end_seat - seat_number = %s - 1
+        ORDER BY section, row, seat_number
+        LIMIT 1
+    ),
+    candidate_locks AS (
+        SELECT ts.id
+        FROM ticket_seats ts
+        JOIN matched_run mr 
+          ON ts.event_id = %s
+         AND ts.section = mr.section
+         AND ts.row = mr.row
+         AND ts.seat_number BETWEEN mr.start_seat AND mr.end_seat
+        WHERE ts.status = 'AVAILABLE' 
+           OR (ts.status = 'HELD' AND ts.held_until < %s)
+        LIMIT %s
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE ticket_seats
+    SET status = 'HELD',
+        held_until = %s,
+        reservation_id = %s,
+        version = ticket_seats.version + 1,
+        updated_at = %s
+    FROM candidate_locks
+    WHERE ticket_seats.id = candidate_locks.id
+    RETURNING ticket_seats.id;
+    """
+
+    section_clause = "AND section = %s" if section else ""
+    formatted_query = contiguous_query.format(section_filter=section_clause)
+
+    with transaction.atomic():
+        event = Event.objects.filter(id=event_id, is_active=True).first()
+        if not event:
+            raise EventNotActive(f"Event with id {event_id} does not exist or is inactive.")
+
+        reservation = Reservation.objects.create(
+            user_id=user_id,
+            event=event,
+            status=ReservationStatus.PENDING,
+            expires_at=expires_at,
+        )
+
+        query_params = [
+            quantity,           # LEAD offset
+            event_id,           # available_seats event_id
+            now,                # available_seats held_until
+        ]
+        if section:
+            query_params.append(section)
+
+        query_params.extend([
+            quantity,           # matched_run subtraction (quantity - 1)
+            event_id,           # candidate_locks join event_id
+            now,                # candidate_locks held_until
+            quantity,           # candidate_locks LIMIT
+            expires_at,         # UPDATE held_until
+            str(reservation.id),# UPDATE reservation_id
+            now,                # UPDATE updated_at
+        ])
+
+        with connection.cursor() as cursor:
+            cursor.execute(formatted_query, query_params)
+            locked_ids = [row[0] for row in cursor.fetchall()]
+
+        # Contiguous block successfully claimed
+        if len(locked_ids) == quantity:
+            InventoryManager(event_id=event_id).decrement(quantity=quantity)
+            return reservation
+
+        # Shortage / fragmentation rollback
+        transaction.set_rollback(True)
+
+    # 3. Fallback path if requested
+    if allow_scattered_fallback:
+        return allocate_seats_orm(
+            event_id=event_id,
+            user_id=user_id,
+            quantity=quantity,
+            hold_duration_seconds=hold_duration_seconds,
+            section=section,
+        )
+
+    raise InsufficientSeatsAvailable(
+        f"Could not allocate {quantity} contiguous seats for event {event_id}."
+    )

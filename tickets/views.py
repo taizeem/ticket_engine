@@ -6,7 +6,7 @@ from django.views.decorators.csrf import csrf_exempt
 from decimal import Decimal, InvalidOperation
 
 from tickets.models import Event, uuid
-from tickets.services import allocate_seats_orm, confirm_reservation_payment
+from tickets.services import allocate_seats_orm, confirm_reservation_payment, allocate_seats_contiguous
 from tickets.exceptions import InsufficientSeatsAvailable, EventNotActive, ReservationAlreadyProcessedError, ReservationExpiredError, InvalidPaymentAmountError
 from tickets.waiting_room.token_bucket import RedisTokenBucket
 from tickets.waiting_room.queue_manager import VirtualWaitingRoom
@@ -70,7 +70,7 @@ class EnterWaitingRoomView(View):
 class AllocateSeatsView(View):
     """
     Protected Checkout: Requires cryptographically valid X-Admission-Token.
-    Executes SELECT FOR UPDATE SKIP LOCKED on PostgreSQL.
+    Supports both contiguous seat allocation and scattered fallback.
     """
 
     def post(self, request: HttpRequest, event_id: int) -> HttpResponse:
@@ -84,6 +84,8 @@ class AllocateSeatsView(View):
             user_id = str(payload["user_id"]).strip()
             quantity = int(payload.get("quantity", 1))
             section = payload.get("section")
+            contiguous = bool(payload.get("contiguous", True))
+            allow_fallback = bool(payload.get("allow_fallback", True))
         except (KeyError, ValueError, json.JSONDecodeError) as e:
             return JsonResponse({"error": f"Invalid payload: {str(e)}"}, status=400)
 
@@ -95,15 +97,25 @@ class AllocateSeatsView(View):
         ):
             return JsonResponse({"error": "Invalid or expired admission token"}, status=403)
 
-        # 2. Invoke core database allocation engine
+        # 2. Invoke allocation service based on seating preference
         try:
-            reservation = allocate_seats_orm(
-                event_id=event_id,
-                user_id=user_id,
-                quantity=quantity,
-                hold_duration_seconds=300,
-                section=section,
-            )
+            if contiguous and quantity > 1:
+                reservation = allocate_seats_contiguous(
+                    event_id=event_id,
+                    user_id=user_id,
+                    quantity=quantity,
+                    hold_duration_seconds=300,
+                    section=section,
+                    allow_scattered_fallback=allow_fallback,
+                )
+            else:
+                reservation = allocate_seats_orm(
+                    event_id=event_id,
+                    user_id=user_id,
+                    quantity=quantity,
+                    hold_duration_seconds=300,
+                    section=section,
+                )
         except EventNotActive as e:
             return JsonResponse({"error": str(e)}, status=400)
         except InsufficientSeatsAvailable as e:
