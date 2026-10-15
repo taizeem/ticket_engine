@@ -1,9 +1,9 @@
-from django.urls import re_path
+from django.urls import path
 from tickets.channels.consumers import WaitingRoomConsumer
 
 websocket_urlpatterns = [
-    re_path(
-        r"^ws/waiting-room/(?P<event_id>\d+)/(?P<user_id>[\w-]+)/$",
+    path(
+        "ws/waiting-room/<int:event_id>/<str:user_id>/",
         WaitingRoomConsumer.as_asgi(),
     ),
 ]

@@ -1,5 +1,6 @@
 from decimal import Decimal
 from datetime import timedelta
+from asgiref.sync import sync_to_async
 from channels.testing import WebsocketCommunicator
 from django.test import TransactionTestCase
 from django.utils import timezone
@@ -52,12 +53,13 @@ class WebSocketWaitingRoomTest(TransactionTestCase):
         # 1. Enqueue user in Redis ZSET
         self.waiting_room.enqueue(user_id=user_id)
 
-        # 2. Establish WebSocket connection
+        # 2. Establish WebSocket connection with origin header
         communicator = WebsocketCommunicator(
             application=application,
             path=f"/ws/waiting-room/{self.event.id}/{user_id}/",
+            headers=[(b"origin", b"http://localhost")],
         )
-        connected, _ = await communicator.connect()
+        connected, subprotocol = await communicator.connect()
         self.assertTrue(connected)
 
         # 3. Assert initial queue status message received
@@ -66,8 +68,11 @@ class WebSocketWaitingRoomTest(TransactionTestCase):
         self.assertEqual(initial_msg["queue_position"], 1)
         self.assertEqual(initial_msg["total_waiting"], 1)
 
-        # 4. Trigger turnstile admission worker
-        admit_waiting_room_batch(event_id=self.event.id, batch_size=1)
+        # 4. Trigger turnstile admission worker safely across thread boundaries
+        await sync_to_async(admit_waiting_room_batch)(
+            event_id=self.event.id,
+            batch_size=1,
+        )
 
         # 5. Assert WebSocket receives live admission token push
         admission_msg = await communicator.receive_json_from(timeout=2.0)

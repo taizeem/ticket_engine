@@ -20,7 +20,15 @@ load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = os.environ["SECRET_KEY"]
 DEBUG = os.environ.get("DEBUG", "False").lower() in ("true", "1")
-ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "").split(",")
+ALLOWED_HOSTS = list(
+    filter(
+        None,
+        set(
+            os.environ.get("ALLOWED_HOSTS", "").split(",")
+            + ["localhost", "127.0.0.1", "testserver"]
+        ),
+    )
+)
 
 
 
