@@ -134,3 +134,24 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://127.0.0.1:6379/1")
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/2")
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = "UTC"
+
+# Production Worker Tuning
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1  # Prevents task hogging by fast workers
+CELERY_TASK_ACKS_LATE = True           # Only acknowledge after task returns successfully
+
+# Celery Beat Periodic Schedule
+CELERY_BEAT_SCHEDULE = {
+    # Sweep expired holds every 5 seconds
+    "sweep-expired-seat-holds": {
+        "task": "tickets.tasks.expiration_tasks.reclaim_expired_seat_holds",
+        "schedule": 5.0,
+        "kwargs": {"batch_size": 500},
+    },
+}
