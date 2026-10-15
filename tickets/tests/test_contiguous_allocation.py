@@ -92,7 +92,9 @@ class ContiguousAllocationTest(TransactionTestCase):
         self.assertEqual(reservation.seats.count(), 3)
 
     def test_concurrent_contiguous_allocations_no_overlap(self):
-        # 2 concurrent threads each requesting 2 adjacent seats in Row B (4 seats total)
+        # Isolate contention to Row B by marking Row A seats as BOOKED for this test
+        Seat.objects.filter(event=self.event, row="A").update(status=SeatStatus.BOOKED)
+
         def worker(user_id: str):
             try:
                 res = allocate_seats_contiguous(
@@ -116,6 +118,7 @@ class ContiguousAllocationTest(TransactionTestCase):
         self.assertEqual(len(seats1), 2)
         self.assertEqual(len(seats2), 2)
 
-        # Zero seat overlap
+        # Zero seat overlap in Row B
         self.assertEqual(len(set(seats1).intersection(set(seats2))), 0)
+        # Together they must cover all 4 seats of Row B: {1, 2, 3, 4}
         self.assertEqual(set(seats1 + seats2), {1, 2, 3, 4})

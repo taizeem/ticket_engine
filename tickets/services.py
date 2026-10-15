@@ -251,6 +251,8 @@ def confirm_reservation_payment(
 
 
 
+# tickets/services.py (Replace existing allocate_seats_contiguous function)
+
 def allocate_seats_contiguous(
     event_id: int,
     user_id: str,
@@ -261,13 +263,12 @@ def allocate_seats_contiguous(
 ) -> Reservation:
     """
     Allocates contiguous adjacent seats within the same section and row.
-    Uses PostgreSQL LEAD() window function to find consecutive seat_number runs.
-    Falls back to scattered seat allocation if adjacent blocks are exhausted and fallback is enabled.
+    Discovers candidate sequences using LEAD(), then attempts SKIP LOCKED acquisition
+    across candidate runs so concurrent workers automatically advance to adjacent blocks.
     """
     if quantity <= 0:
         raise ValueError("Allocation quantity must be greater than zero.")
 
-    # 1-seat requests are inherently contiguous
     if quantity == 1:
         return allocate_seats_orm(
             event_id=event_id,
@@ -280,10 +281,11 @@ def allocate_seats_contiguous(
     now = timezone.now()
     expires_at = now + timedelta(seconds=hold_duration_seconds)
 
-    contiguous_query = """
-    WITH available_seats AS (
+    # 1. Candidate Discovery Query
+    candidate_sql = f"""
+    SELECT section, row, seat_number AS start_seat, end_seat
+    FROM (
         SELECT 
-            id,
             section,
             row,
             seat_number,
@@ -297,42 +299,30 @@ def allocate_seats_contiguous(
               status = 'AVAILABLE' 
               OR (status = 'HELD' AND held_until < %s)
           )
-          {section_filter}
-    ),
-    matched_run AS (
-        SELECT section, row, seat_number AS start_seat, end_seat
-        FROM available_seats
-        WHERE end_seat IS NOT NULL
-          AND end_seat - seat_number = %s - 1
-        ORDER BY section, row, seat_number
-        LIMIT 1
-    ),
-    candidate_locks AS (
-        SELECT ts.id
-        FROM ticket_seats ts
-        JOIN matched_run mr 
-          ON ts.event_id = %s
-         AND ts.section = mr.section
-         AND ts.row = mr.row
-         AND ts.seat_number BETWEEN mr.start_seat AND mr.end_seat
-        WHERE ts.status = 'AVAILABLE' 
-           OR (ts.status = 'HELD' AND ts.held_until < %s)
-        LIMIT %s
-        FOR UPDATE SKIP LOCKED
-    )
-    UPDATE ticket_seats
-    SET status = 'HELD',
-        held_until = %s,
-        reservation_id = %s,
-        version = ticket_seats.version + 1,
-        updated_at = %s
-    FROM candidate_locks
-    WHERE ticket_seats.id = candidate_locks.id
-    RETURNING ticket_seats.id;
+          {"AND section = %s" if section else ""}
+    ) sub
+    WHERE end_seat IS NOT NULL 
+      AND end_seat - seat_number = %s - 1
+    ORDER BY section, row, seat_number;
     """
 
-    section_clause = "AND section = %s" if section else ""
-    formatted_query = contiguous_query.format(section_filter=section_clause)
+    candidate_params = [quantity, event_id, now]
+    if section:
+        candidate_params.append(section)
+    candidate_params.append(quantity)
+
+    # 2. Lock Acquisition Query (per candidate run)
+    lock_sql = """
+    SELECT id
+    FROM ticket_seats
+    WHERE event_id = %s 
+      AND section = %s 
+      AND row = %s
+      AND seat_number BETWEEN %s AND %s
+      AND (status = 'AVAILABLE' OR (status = 'HELD' AND held_until < %s))
+    LIMIT %s
+    FOR UPDATE SKIP LOCKED;
+    """
 
     with transaction.atomic():
         event = Event.objects.filter(id=event_id, is_active=True).first()
@@ -346,37 +336,45 @@ def allocate_seats_contiguous(
             expires_at=expires_at,
         )
 
-        query_params = [
-            quantity,           # LEAD offset
-            event_id,           # available_seats event_id
-            now,                # available_seats held_until
-        ]
-        if section:
-            query_params.append(section)
-
-        query_params.extend([
-            quantity,           # matched_run subtraction (quantity - 1)
-            event_id,           # candidate_locks join event_id
-            now,                # candidate_locks held_until
-            quantity,           # candidate_locks LIMIT
-            expires_at,         # UPDATE held_until
-            str(reservation.id),# UPDATE reservation_id
-            now,                # UPDATE updated_at
-        ])
-
         with connection.cursor() as cursor:
-            cursor.execute(formatted_query, query_params)
-            locked_ids = [row[0] for row in cursor.fetchall()]
+            # Discover candidate runs
+            cursor.execute(candidate_sql, candidate_params)
+            candidate_runs = cursor.fetchall()
 
-        # Contiguous block successfully claimed
-        if len(locked_ids) == quantity:
+            claimed_seat_ids = []
+            for sec, row_val, start_s, end_s in candidate_runs:
+                cursor.execute(
+                    lock_sql,
+                    [event_id, sec, row_val, start_s, end_s, now, quantity],
+                )
+                locked_ids = [r[0] for r in cursor.fetchall()]
+
+                # Only proceed if we secured all N contiguous seats without skips
+                if len(locked_ids) == quantity:
+                    claimed_seat_ids = locked_ids
+                    # Bulk update the locked seats to HELD
+                    cursor.execute(
+                        """
+                        UPDATE ticket_seats
+                        SET status = 'HELD',
+                            held_until = %s,
+                            reservation_id = %s,
+                            version = ticket_seats.version + 1,
+                            updated_at = %s
+                        WHERE id = ANY(%s);
+                        """,
+                        [expires_at, str(reservation.id), now, claimed_seat_ids],
+                    )
+                    break
+
+        if len(claimed_seat_ids) == quantity:
             InventoryManager(event_id=event_id).decrement(quantity=quantity)
             return reservation
 
-        # Shortage / fragmentation rollback
+        # Abort transaction if no full contiguous run could be locked
         transaction.set_rollback(True)
 
-    # 3. Fallback path if requested
+    # 3. Fallback to scattered allocation if allowed
     if allow_scattered_fallback:
         return allocate_seats_orm(
             event_id=event_id,
