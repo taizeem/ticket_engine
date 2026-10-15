@@ -1,10 +1,16 @@
+from decimal import Decimal
 from datetime import timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 from django.db import transaction, connection, models
 from django.utils import timezone
 
-from .models import Event, Seat, SeatStatus, Reservation, ReservationStatus
-from .exceptions import InsufficientSeatsAvailable, EventNotActive
+from .models import Event, Seat, SeatStatus, Reservation, ReservationStatus, PaymentRecord
+from .exceptions import (
+    InsufficientSeatsAvailable,
+    EventNotActive,
+    InvalidPaymentAmountError,
+    ReservationExpiredError,
+    ReservationAlreadyProcessedError)
 
 
 def allocate_seats_orm(
@@ -141,3 +147,101 @@ def allocate_seats_raw_cte(
             )
 
     return reservation
+
+def confirm_reservation_payment(
+    reservation_id: str,
+    idempotency_key: str,
+    payment_reference: str,
+    amount: Decimal,
+) -> Tuple[Reservation, bool]:
+    """
+    Finalizes an unconfirmed booking upon successful payment webhook delivery.
+    Guarantees strict idempotency: duplicate deliveries return the existing record
+    without re-mutating seat or ledger states.
+    Returns: (reservation, is_newly_confirmed)
+    """
+    now = timezone.now()
+
+    with transaction.atomic():
+        # 1. Idempotency Check: Return immediately if this key was already processed
+        existing_payment = (
+            PaymentRecord.objects.select_for_update()
+            .filter(idempotency_key=idempotency_key)
+            .first()
+        )
+        if existing_payment:
+            return existing_payment.reservation, False
+
+        # 2. Lock the Reservation row exclusively
+        reservation = (
+            Reservation.objects.select_for_update()
+            .filter(id=reservation_id)
+            .first()
+        )
+        if not reservation:
+            raise ValueError(f"Reservation {reservation_id} not found.")
+
+        # 3. State Invariant Checks
+        if reservation.status == ReservationStatus.CONFIRMED:
+            # Already confirmed under another key; record payment reference
+            PaymentRecord.objects.create(
+                idempotency_key=idempotency_key,
+                reservation=reservation,
+                payment_reference=payment_reference,
+                amount=amount,
+                status="SUCCESS",
+            )
+            return reservation, False
+
+        if reservation.status != ReservationStatus.PENDING:
+            raise ReservationAlreadyProcessedError(
+                f"Reservation {reservation_id} is in status '{reservation.status}' and cannot be confirmed."
+            )
+
+        if reservation.expires_at <= now:
+            # Hold has expired: mark reservation expired and release seats
+            reservation.status = ReservationStatus.EXPIRED
+            reservation.save(update_fields=["status", "updated_at"])
+            Seat.objects.filter(reservation=reservation, status=SeatStatus.HELD).update(
+                status=SeatStatus.AVAILABLE,
+                held_until=None,
+                reservation=None,
+                version=models.F("version") + 1,
+                updated_at=now,
+            )
+            raise ReservationExpiredError(
+                f"Reservation {reservation_id} expired at {reservation.expires_at.isoformat()}."
+            )
+
+        # 4. Verify Payment Amount against locked seats
+        held_seats = list(
+            Seat.objects.select_for_update()
+            .filter(reservation=reservation, status=SeatStatus.HELD)
+        )
+        expected_total = sum(seat.price for seat in held_seats)
+        if amount != expected_total:
+            raise InvalidPaymentAmountError(
+                f"Expected amount {expected_total}, but received {amount}."
+            )
+
+        # 5. Atomically transition state: HELD -> BOOKED, PENDING -> CONFIRMED
+        reservation.status = ReservationStatus.CONFIRMED
+        reservation.updated_at = now
+        reservation.save(update_fields=["status", "updated_at"])
+
+        Seat.objects.filter(id__in=[s.id for s in held_seats]).update(
+            status=SeatStatus.BOOKED,
+            held_until=None,
+            version=models.F("version") + 1,
+            updated_at=now,
+        )
+
+        PaymentRecord.objects.create(
+            idempotency_key=idempotency_key,
+            reservation=reservation,
+            payment_reference=payment_reference,
+            amount=amount,
+            status="SUCCESS",
+        )
+
+    return reservation, True

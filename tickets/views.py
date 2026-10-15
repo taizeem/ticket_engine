@@ -3,10 +3,11 @@ from django.views import View
 from django.http import JsonResponse, HttpRequest, HttpResponse
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
+from decimal import Decimal, InvalidOperation
 
-from tickets.models import Event
-from tickets.services import allocate_seats_orm
-from tickets.exceptions import InsufficientSeatsAvailable, EventNotActive
+from tickets.models import Event, uuid
+from tickets.services import allocate_seats_orm, confirm_reservation_payment
+from tickets.exceptions import InsufficientSeatsAvailable, EventNotActive, ReservationAlreadyProcessedError, ReservationExpiredError, InvalidPaymentAmountError
 from tickets.waiting_room.token_bucket import RedisTokenBucket
 from tickets.waiting_room.queue_manager import VirtualWaitingRoom
 from tickets.waiting_room.admission import generate_admission_pass, verify_admission_pass
@@ -129,4 +130,66 @@ class AllocateSeatsView(View):
                 "seats": allocated_seats,
             },
             status=201,
+        )
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ConfirmReservationView(View):
+    """
+    Idempotent Webhook Endpoint: Finalizes checkout upon gateway payment confirmation.
+    Expects 'Idempotency-Key' in HTTP headers or JSON payload.
+    """
+
+    def post(self, request: HttpRequest, reservation_id: str) -> HttpResponse:
+        idempotency_key = (
+            request.headers.get("Idempotency-Key")
+            or request.headers.get("X-Idempotency-Key")
+        )
+
+        try:
+            payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+            if not idempotency_key:
+                idempotency_key = payload.get("idempotency_key")
+
+            if not idempotency_key:
+                return JsonResponse({"error": "Missing Idempotency-Key header or payload parameter."}, status=400)
+
+            payment_reference = payload.get("payment_reference", f"pay_{uuid.uuid4().hex[:12]}")
+            amount = Decimal(str(payload["amount"]))
+        except (KeyError, ValueError, InvalidOperation, json.JSONDecodeError) as e:
+            return JsonResponse({"error": f"Invalid confirmation payload: {str(e)}"}, status=400)
+
+        try:
+            reservation, is_newly_confirmed = confirm_reservation_payment(
+                reservation_id=reservation_id,
+                idempotency_key=idempotency_key,
+                payment_reference=payment_reference,
+                amount=amount,
+            )
+        except ReservationExpiredError as e:
+            return JsonResponse({"error": str(e)}, status=410)  # 410 Gone
+        except (ReservationAlreadyProcessedError, InvalidPaymentAmountError) as e:
+            return JsonResponse({"error": str(e)}, status=409)  # 409 Conflict
+        except ValueError as e:
+            return JsonResponse({"error": str(e)}, status=404)
+
+        confirmed_seats = [
+            {
+                "id": seat.id,
+                "section": seat.section,
+                "row": seat.row,
+                "seat_number": seat.seat_number,
+                "ticket_code": f"TICK-{seat.id}-{reservation.id.hex[:8].upper()}",
+            }
+            for seat in reservation.seats.all()
+        ]
+
+        return JsonResponse(
+            {
+                "status": "CONFIRMED",
+                "is_newly_confirmed": is_newly_confirmed,
+                "reservation_id": str(reservation.id),
+                "payment_reference": payment_reference,
+                "tickets": confirmed_seats,
+            },
+            status=200 if not is_newly_confirmed else 201,
         )
