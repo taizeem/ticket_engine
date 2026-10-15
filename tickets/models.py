@@ -114,3 +114,26 @@ class Seat(models.Model):
 
     def __str__(self):
         return f"{self.event.name} - Sec {self.section} Row {self.row} #{self.seat_number}"
+
+
+class PaymentRecord(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    idempotency_key = models.CharField(max_length=255, unique=True, db_index=True)
+    reservation = models.ForeignKey(
+        Reservation,
+        on_delete=models.CASCADE,
+        related_name="payment_records",
+    )
+    payment_reference = models.CharField(max_length=255, db_index=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=32, default="SUCCESS")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "ticket_payment_records"
+        indexes = [
+            models.Index(fields=["reservation", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Payment {self.payment_reference} ({self.status}) for {self.reservation_id}"
