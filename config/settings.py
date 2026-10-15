@@ -155,3 +155,7 @@ CELERY_BEAT_SCHEDULE = {
         "kwargs": {"batch_size": 500},
     },
 }
+CELERY_IMPORTS = [
+    "tickets.tasks.expiration_tasks",
+    "tickets.tasks.turnstile_tasks",
+]
