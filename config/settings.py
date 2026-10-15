@@ -33,6 +33,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+
+    'tickets',
 ]
 
 MIDDLEWARE = [
@@ -77,7 +79,7 @@ DATABASES = {
         "PASSWORD": os.environ["DB_PASSWORD"],
         "HOST": os.environ["DB_HOST"],
         "PORT": os.environ.get("DB_PORT", "5432"),
-        "CONN_MAX_AGE": int(os.environ.get("DB_CONN_MAX_AGE", 600)),
+        "CONN_MAX_AGE": 0,
         "OPTIONS": {
             # Django 5.1+ native psycopg3 connection pool
             "pool": {
