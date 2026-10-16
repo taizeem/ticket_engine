@@ -5,6 +5,7 @@ import secrets
 from typing import Tuple, Dict, Any
 from django.conf import settings
 from tickets.waiting_room import get_redis_client
+from tickets.metrics import POW_VERIFICATIONS_TOTAL
 
 
 def generate_pow_challenge(
@@ -84,6 +85,23 @@ def verify_pow_solution(
     if not candidate_hash.startswith(required_prefix):
         return False, "Incorrect proof-of-work solution."
 
+    if (now - timestamp) > ttl_seconds or timestamp > (now + 5):
+        POW_VERIFICATIONS_TOTAL.labels(status="expired").inc()
+        return False, "Challenge has expired."
+
+    if not hmac.compare_digest(signature, expected_sig):
+        POW_VERIFICATIONS_TOTAL.labels(status="invalid").inc()
+        return False, "Invalid challenge signature."
+
+    if not is_fresh:
+        POW_VERIFICATIONS_TOTAL.labels(status="replay").inc()
+        return False, "Challenge solution has already been spent."
+
+    if not candidate_hash.startswith(required_prefix):
+        POW_VERIFICATIONS_TOTAL.labels(status="invalid").inc()
+        return False, "Incorrect proof-of-work solution."
+
+    POW_VERIFICATIONS_TOTAL.labels(status="valid").inc()
     return True, "Valid."
 
 

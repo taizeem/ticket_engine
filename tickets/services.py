@@ -13,6 +13,10 @@ from tickets.exceptions import (
     InvalidPaymentAmountError,
 )
 from tickets.waiting_room.inventory import InventoryManager
+from tickets.metrics import (
+    ALLOCATION_DURATION_SECONDS,
+    RESERVATIONS_CONFIRMED_TOTAL,
+)
 
 
 def allocate_seats_orm(
@@ -31,6 +35,7 @@ def allocate_seats_orm(
 
     now = timezone.now()
     expires_at = now + timedelta(seconds=hold_duration_seconds)
+    start_time = timezone.now().timestamp()
 
     with transaction.atomic():
         event = Event.objects.filter(id=event_id, is_active=True).first()
@@ -71,6 +76,7 @@ def allocate_seats_orm(
             version=models.F("version") + 1,
             updated_at=now,
         )
+        ALLOCATION_DURATION_SECONDS.observe(timezone.now().timestamp() - start_time)
 
     return reservation
 
@@ -160,7 +166,7 @@ def confirm_reservation_payment(
     expired_timestamp = None
 
     with transaction.atomic():
-        # 1. Idempotency Check
+        # 1. Idempotency Check (Duplicate webhook replay -> return False)
         existing_payment = (
             PaymentRecord.objects.select_for_update()
             .filter(idempotency_key=idempotency_key)
@@ -207,7 +213,6 @@ def confirm_reservation_payment(
             )
             is_expired = True
             expired_timestamp = reservation.expires_at
-            # Notice: No exception raised here. The atomic block finishes and commits to PostgreSQL!
         else:
             # 4. Verify Payment Amount against locked seats
             held_seats = list(
@@ -240,7 +245,10 @@ def confirm_reservation_payment(
                 status="SUCCESS",
             )
 
-    # 6. Raise outside transaction.atomic() so the database updates remain committed
+            # Record Prometheus telemetry for the newly confirmed booking
+            RESERVATIONS_CONFIRMED_TOTAL.inc()
+
+    # 6. Raise outside transaction.atomic() so cleanup remains committed
     if is_expired:
         raise ReservationExpiredError(
             f"Reservation {reservation_id} expired at {expired_timestamp.isoformat()}."
@@ -249,9 +257,6 @@ def confirm_reservation_payment(
     return reservation, True
 
 
-
-
-# tickets/services.py (Replace existing allocate_seats_contiguous function)
 
 def allocate_seats_contiguous(
     event_id: int,

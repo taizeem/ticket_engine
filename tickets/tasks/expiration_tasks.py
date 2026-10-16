@@ -2,6 +2,7 @@ from celery import shared_task
 from django.db import transaction, models
 from django.utils import timezone
 from tickets.models import Seat, SeatStatus, Reservation, ReservationStatus
+from tickets.metrics import SEATS_RECLAIMED_TOTAL
 
 
 @shared_task(name="tickets.tasks.expiration_tasks.reclaim_expired_seat_holds")
@@ -46,5 +47,6 @@ def reclaim_expired_seat_holds(batch_size: int = 500) -> int:
             status=ReservationStatus.EXPIRED,
             updated_at=now,
         )
-
+    if reclaimed_seats_count > 0:
+        SEATS_RECLAIMED_TOTAL.inc(reclaimed_seats_count)
     return reclaimed_seats_count

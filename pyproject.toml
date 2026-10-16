@@ -13,6 +13,7 @@ dependencies = [
     "channels-redis>=4.2.0",
     "daphne>=4.1.0",
     "django>=5.1,<5.2",
+    "prometheus-client>=0.20.0",
     "psycopg[binary,pool]>=3.2",
     "python-dotenv>=1.2.4",
     "redis>=5.0.0",

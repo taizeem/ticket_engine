@@ -8,6 +8,7 @@ from tickets.views import (
     CancelReservationView,
     )
 from tickets.views_health import LivenessProbeView, ReadinessProbeView
+from tickets.views_metrics import PrometheusMetricsView
 urlpatterns = [
     path("healthz/live/", LivenessProbeView.as_view(), name="health_liveness"),
     path("healthz/ready/", ReadinessProbeView.as_view(), name="health_readiness"),
@@ -18,4 +19,5 @@ urlpatterns = [
     path("api/events/<int:event_id>/allocate/", AllocateSeatsView.as_view(), name="allocate_seats"),
     path("api/reservations/<uuid:reservation_id>/confirm/", ConfirmReservationView.as_view(), name="confirm_reservation"),
     path("api/reservations/<uuid:reservation_id>/cancel/", CancelReservationView.as_view(), name="cancel_reservation"),
+    path("metrics/", PrometheusMetricsView.as_view(), name="prometheus_metrics"),
 ]
