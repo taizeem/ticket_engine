@@ -387,3 +387,49 @@ def allocate_seats_contiguous(
     raise InsufficientSeatsAvailable(
         f"Could not allocate {quantity} contiguous seats for event {event_id}."
     )
+
+def cancel_reservation(reservation_id: str, reason: str = "User requested cancellation") -> Reservation:
+    """
+    Atomically cancels a reservation (PENDING or CONFIRMED), releases its seats
+    back to AVAILABLE, updates Redis inventory, and resets the sold-out circuit breaker.
+    """
+    now = timezone.now()
+
+    with transaction.atomic():
+        reservation = (
+            Reservation.objects.select_for_update()
+            .filter(id=reservation_id)
+            .first()
+        )
+        if not reservation:
+            raise ValueError(f"Reservation {reservation_id} not found.")
+
+        if reservation.status in (ReservationStatus.EXPIRED, ReservationStatus.CANCELLED):
+            raise ValueError(f"Reservation is already {reservation.status}.")
+
+        # Lock and count associated seats
+        held_seats = list(
+            Seat.objects.select_for_update()
+            .filter(reservation=reservation)
+        )
+        seat_count = len(held_seats)
+
+        # 1. Reset seats to AVAILABLE inventory
+        Seat.objects.filter(reservation=reservation).update(
+            status=SeatStatus.AVAILABLE,
+            held_until=None,
+            reservation=None,
+            version=models.F("version") + 1,
+            updated_at=now,
+        )
+
+        # 2. Update reservation status
+        reservation.status = ReservationStatus.CANCELLED
+        reservation.updated_at = now
+        reservation.save(update_fields=["status", "updated_at"])
+
+        # 3. Replenish Redis inventory counter and reset circuit breaker
+        if seat_count > 0:
+            InventoryManager(event_id=reservation.event_id).increment(quantity=seat_count)
+
+    return reservation

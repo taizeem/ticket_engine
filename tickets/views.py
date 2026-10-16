@@ -6,7 +6,7 @@ from django.views.decorators.csrf import csrf_exempt
 from decimal import Decimal, InvalidOperation
 
 from tickets.models import Event, uuid
-from tickets.services import allocate_seats_orm, confirm_reservation_payment, allocate_seats_contiguous
+from tickets.services import allocate_seats_orm, confirm_reservation_payment, allocate_seats_contiguous, cancel_reservation
 from tickets.exceptions import InsufficientSeatsAvailable, EventNotActive, ReservationAlreadyProcessedError, ReservationExpiredError, InvalidPaymentAmountError
 from tickets.waiting_room.token_bucket import RedisTokenBucket
 from tickets.waiting_room.queue_manager import VirtualWaitingRoom
@@ -325,6 +325,33 @@ class EventAvailabilityView(View):
                 "event_id": event_id,
                 "available_seats": available_count,
                 "status": "AVAILABLE" if available_count > 0 else "SOLD_OUT",
+            },
+            status=200,
+        )
+
+@method_decorator(csrf_exempt, name="dispatch")
+class CancelReservationView(View):
+    """
+    Cancellation Endpoint: Releases seats back to active inventory and replenishes Redis.
+    """
+
+    def post(self, request: HttpRequest, reservation_id: str) -> HttpResponse:
+        try:
+            payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+            reason = payload.get("reason", "User requested cancellation")
+        except json.JSONDecodeError:
+            reason = "User requested cancellation"
+
+        try:
+            reservation = cancel_reservation(reservation_id=reservation_id, reason=reason)
+        except ValueError as e:
+            return JsonResponse({"error": str(e)}, status=400)
+
+        return JsonResponse(
+            {
+                "status": "CANCELLED",
+                "reservation_id": str(reservation.id),
+                "reclaimed_seats": reservation.seats.count(),
             },
             status=200,
         )
