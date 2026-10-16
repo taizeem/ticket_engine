@@ -7,163 +7,202 @@ A distributed, concurrency-hardened flash-sale ticketing platform engineered to 
 
 Built with **Django 5.1**, **PostgreSQL 16** (`SELECT FOR UPDATE SKIP LOCKED`), **Redis 7** (Lua Token Bucket & ZSET Virtual Waiting Rooms), **Django Channels & Daphne** (ASGI WebSockets), and **Celery** background worker pools.
 
+## 1. High-Level Architecture Diagram
+
 
 ```
 
-# ==================================================================================================
-SYSTEM TOPOLOGY & DATA PLANE
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                       DISTRIBUTED TOPOLOGY                                        │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ```
-                        [ Inbound Traffic: 50,000 req/s ]
-                                       │
-                                       ▼
-                            [ Load Balancer / Ingress ]
-                                       │
-              ┌────────────────────────┴────────────────────────┐
-              ▼                                                 ▼
-  [ Daphne ASGI Node 1 ]                            [ Daphne ASGI Node 2 ]
-  (HTTP & WebSockets)                               (HTTP & WebSockets)
-              │                                                 │
-              └────────────────────────┬────────────────────────┘
-                                       │
-   ┌───────────────────────────────────┼───────────────────────────────────┐
-   ▼                                   ▼                                   ▼
+                              [ Inbound Traffic: 50,000 req/s ]
+                                              │
+                                              ▼
+                                  [ Nginx / Cloudflare ALB ]
+                                              │
+                     ┌────────────────────────┴────────────────────────┐
+                     ▼                                                 ▼
+         [ Daphne ASGI Instance 1 ]                        [ Daphne ASGI Instance 2 ]
+         (HTTP API + WebSockets)                           (HTTP API + WebSockets)
+                     │                                                 │
+                     └────────────────────────┬────────────────────────┘
+                                              │
+          ┌───────────────────────────────────┼───────────────────────────────────┐
+          ▼                                   ▼                                   ▼
+┌───────────────────┐               ┌───────────────────┐               ┌───────────────────┐
+│    Redis DB 0     │               │   Redis DB 1 & 2  │               │    Redis DB 3     │
+│   (Edge Guards)   │               │  (Celery Broker)  │               │ (Channels Layer)  │
+├───────────────────┤               ├───────────────────┤               ├───────────────────┤
+│ • Sold-Out Breaker│               │ • DB 1: Task Queue│               │ • WebSocket Groups│
+│ • PoW Nonce Store │               │ • DB 2: Results   │               │ • Real-time Push  │
+│ • Lua Token Bucket│               └─────────┬─────────┘               └───────────────────┘
+│ • ZSET Queue Room │                         │
+└───────────────────┘                         ▼
+                                   ┌─────────────────────┐
+                                   │ Celery Worker Pool  │
+                                   ├─────────────────────┤
+                                   │ • Turnstile Worker  │
+                                   │ • Hold Sweeper (5s) │
+                                   └──────────┬──────────┘
+                                              │
+                                              ▼
+                                 ┌─────────────────────────┐
+                                 │      PostgreSQL 16      │
+                                 ├─────────────────────────┤
+                                 │ • Client-side Pool (50) │
+                                 │ • Partial B-Tree Index  │
+                                 │ • SKIP LOCKED Row Locks │
+                                 │ • Contiguous Window CTE │
+                                 └─────────────────────────┘
 
 ```
 
-[ Redis DB 0: Core ]              [ Redis DB 1 & 2 ]                 [ Redis DB 3: Channels ]
-├── Sold-Out Circuit Breaker      ├── DB 1: Celery Broker            └── WebSocket Channel Layer
-├── Anti-Bot Nonce Registry       └── DB 2: Celery Result Backend         (Real-time queue updates)
-├── Lua Token Bucket (100 req/s)
-└── ZSET Virtual Waiting Room             │
-▼
-[ Celery Worker Pool ]
-├── Turnstile Batch Worker (Pops ZSET -> Pushes to WebSockets)
-└── Hold Expiration Sweeper (Sweeps expired holds every 5s)
+```
+
+## 2. Life of a Flash-Sale Request (Ingress Funnel)
+
+
+```
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 END-TO-END REQUEST LIFECYCLE                                      │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+[ Client Request: POST /api/events//enter/ ]
 │
 ▼
-[ PostgreSQL 16 Database ]
-├── Native Client-Side Connection Pool
-├── Partial B-Tree Indexes (status = 'AVAILABLE')
-├── Row Locks: SELECT FOR UPDATE SKIP LOCKED
-└── Window CTE: Contiguous Adjacent Seat Selection
-
-```
-
-## System Architecture & Data Flow
-
-
-```
-
-# ==================================================================================================
-THE 5-STAGE INGRESS FUNNEL
-
-[ Inbound HTTP Request ]
+[ Sold-Out Circuit Breaker ] ──────────────► [ Tripped (0 seats) ] ──► HTTP 410 Gone (0.2ms)
+│ (Seats Available)
+▼
+[ Anti-Bot Proof-of-Work ] ────────────────► [ Invalid Hash / Replay ] ──► HTTP 403 Forbidden
+│ (Valid 65k-hash SHA-256)
+▼
+[ Redis Lua Token Bucket ]
+│
+┌──────────────┴──────────────┐
+▼                             ▼
+[ Token Available ]         [ Tokens Exhausted ]
+(Direct Fast-Path)          (Congestion Burst)
+│                             │
+│                             ▼
+│                 [ Enqueue into Redis ZSET ]
+│                 (FIFO order via arrival score)
+│                             │
+│                             ▼
+│                 [ Celery Turnstile Worker ]
+│                 (Pops next batch of users)
+│                             │
+│                             ▼
+│                 [ Channels WebSocket Push ]
+│                 (Streams HMAC admission pass)
+│                             │
+└──────────────┬──────────────┘
 │
 ▼
-
-1. CORRELATION TRACING ────► Injects unique X-Request-ID across HTTP, DB, and Celery layers
+[ POST /api/events//allocate/ ]
+(Guarded by X-Admission-Token)
 │
 ▼
-2. SOLD-OUT CIRCUIT BREAKER  Evaluates Redis memory flag (circuit_breaker::sold_out)
-├── [Tripped: 1] ─► Returns HTTP 410 Gone in 0.2ms (Zero DB/Queue Overhead)
-│
-▼ [Active: 0]
-3. ANTI-BOT PoW GATE ─────── Validates client-side 65k-hash SHA-256 puzzle in O(1) time
-├── [Invalid] ────► Returns HTTP 403 Forbidden
-│
-▼ [Valid & Nonce Fresh via Redis SET NX]
-4. ATOMIC TOKEN BUCKET ───── Evaluates Redis Lua script (100 req/s refill, 200 burst capacity)
-│
-├── [Tokens Available: Fast-Path] ─────────────┐
-│                                              │
-▼ [Tokens Depleted: Burst Congestion]          │
-5. VIRTUAL WAITING ROOM ──► Enqueues client into Redis   │
-(Redis Sorted Set)       ZSET keyed by arrival time   │
-│                 (O(log N) rank calculation)  │
-│                                              │
-▼                                              │
-[ Celery Turnstile ] ──► Pops top N users & issues    │
-HMAC-SHA256 Admission Pass   │
-│                                              │
-▼                                              │
-[ WebSockets (ASGI) ] ─► Streams live queue position  │
-and pushes admission token   │
-│                                              │
-└──────────────────────┬───────────────────────┘
-▼
-[ /api/events//allocate/ (X-Admission-Token) ]
+[ PostgreSQL Row-Level Allocation ]
+(SELECT FOR UPDATE SKIP LOCKED)
 │
 ▼
-[ PostgreSQL SELECT FOR UPDATE SKIP LOCKED Allocation ]
-├── Filters via Partial Index: idx_seats_available_partial
-└── Executes Contiguous Window Query: LEAD(seat_number)
+[ POST /api/reservations//confirm/ ]
+(Guarded by Idempotency-Key)
 │
 ▼
-[ /api/reservations//confirm/ (Idempotency-Key) ]
-├── Validates gateway signature and locks Reservation
-└── Atomically transitions: HELD -> BOOKED
+[ Booking Finalized: HELD -> BOOKED ]
 
 ```
 
-## Seat State Machine
-
-
-```
-
-# ==================================================================================================
-SEAT & RESERVATION LIFECYCLE
-
-```
-                   ┌────────────────────────────────────────┐
-                   │               AVAILABLE                │◄─────────────────────┐
-                   └───────────────────┬────────────────────┘                      │
-                                       │                                           │
-                     allocate_seats    │ (SELECT FOR UPDATE                        │
-                     with TTL hold     │  SKIP LOCKED)                             │
-                                       ▼                                           │
-                   ┌────────────────────────────────────────┐                      │
-                   │                 HELD                   │                      │
-                   │    (Temporary 300s TTL Hold Window)    │                      │
-                   └─────────┬───────────────────┬──────────┘                      │
-                             │                   │                                 │
-            Payment Success  │                   │ TTL Expires                     │ User Cancels
-            within TTL       │                   │ (held_until < NOW())            │ Booking
-                             ▼                   ▼                                 │
- ┌───────────────────────────────┐   ┌───────────────────────────────┐             │
- │            BOOKED             │   │            EXPIRED            │             │
- │    (Reservation CONFIRMED     │   │     (Swept by Celery Beat     │             │
- │     via Idempotency-Key)      │   │      or Allocation Query)     │             │
- └───────────────┬───────────────┘   └───────────────┬───────────────┘             │
-                 │                                   │                             │
-                 │                                   └─────────────────────────────┤
-                 │ User Requests Refund / Cancellation                             │
-                 └─────────────────────────────────────────────────────────────────┘
-
-```
-
-```
-
-## Contiguous Seating Allocation Mechanism
+## 3. Concurrency Mechanism: Standard Row Locking vs. SKIP LOCKED
 
 
 ```
 
-# ==================================================================================================
-POSTGRESQL WINDOW FUNCTION ALLOCATION (LEAD)
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                       LOCK CONVOY ELIMINATION: HOW SKIP LOCKED WORKS                             │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-Row B Inventory:  [Seat 1: Avail]  [Seat 2: Avail]  [Seat 3: Avail]  [Seat 4: Avail]
+## TRADITIONAL ROW LOCKING (Lock Convoy & Starvation)
+
+Worker 1: ──► [ Lock Seat #1 ] ──(Holding lock for 25ms...)──────────────────► [ Success ]
+Worker 2: ──► [ Requests Seat #1 ] ──► [ BLOCKED: Waiting on Worker 1... ] ──► [ Thread Blocked ]
+Worker 3: ──► [ Requests Seat #1 ] ──► [ BLOCKED: Waiting on Worker 2... ] ──► [ Timeout / 500 ]
+
+## POSTGRESQL SKIP LOCKED (Lock-Free Parallel Throughput)
+
+Worker 1: ──► [ Lock Seat #1 ] ───────────────► Acquired Seat #1 immediately   (Latency: 2ms)
+Worker 2: ──► [ Seat #1 Locked -> SKIPS ] ────► Acquired Seat #2 immediately   (Latency: 2ms)
+Worker 3: ──► [ Seats #1, #2 Locked -> SKIPS ]► Acquired Seat #3 immediately   (Latency: 2ms)
+
+```
+
+## 4. Seat State Machine Diagram
+
+
+```
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   SEAT & RESERVATION LIFECYCLE                                    │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+```
+                            ┌─────────────────────────┐
+                            │        AVAILABLE        │◄─────────────────────────┐
+                            └────────────┬────────────┘                          │
+                                         │                                       │
+                           allocate_seats│ (SELECT FOR UPDATE                    │
+                           with 300s TTL │  SKIP LOCKED)                         │
+                                         ▼                                       │
+                            ┌─────────────────────────┐                          │
+                            │          HELD           │                          │
+                            └──────┬────────────┬─────┘                          │
+                                   │            │                                │
+                   Payment Success │            │ TTL Expires                    │ User Cancels
+                   within 300s TTL │            │ (held_until < NOW())           │ Booking
+                                   ▼            ▼                                │
+                    ┌──────────────┐    ┌──────────────┐                         │
+                    │    BOOKED    │    │   EXPIRED    │                         │
+                    │ (Reservation │    │ (Reclaimed by│                         │
+                    │  CONFIRMED)  │    │ Celery Beat) │                         │
+                    └──────┬───────┘    └───────┬──────┘                         │
+                           │                    │                                │
+                           │                    └────────────────────────────────┤
+                           │                                                     │
+                           └───────── User Requests Cancellation / Refund ───────┘
+
+```
+
+```
+
+## 5. Contiguous Seating Allocation Mechanics
+
+
+```
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                CONTIGUOUS SEATING ALGORITHM (LEAD)                                │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+Row B Physical Seats:  [Seat 1: Avail]  [Seat 2: Avail]  [Seat 3: Avail]  [Seat 4: Avail]
 │
 ▼
-Window Evaluation: LEAD(seat_number, 2 - 1) OVER (PARTITION BY section, row ORDER BY seat_number)
-• For Seat 1: end_seat = 2. Span: (2 - 1) = 1 == (qty - 1) ──► Valid Run [Seats 1, 2]
-• For Seat 3: end_seat = 4. Span: (4 - 3) = 1 == (qty - 1) ──► Valid Run [Seats 3, 4]
+PostgreSQL Window Query: LEAD(seat_number, 2 - 1) OVER (PARTITION BY section, row ORDER BY seat_number)
 
-Concurrency Handling under Race Condition:
-• Worker 1 locks candidate run [Seats 1, 2] via SELECT ... FOR UPDATE SKIP LOCKED
-• Worker 2 encounters locked [Seats 1, 2] -> SKIP LOCKED returns 0 rows
-• Worker 2 automatically advances loop to evaluate run [Seats 3, 4] -> Locks [Seats 3, 4]
-• Outcome: Zero lock waiting, zero thread blocking, zero seat overlap
+• Evaluates Seat 1: end_seat = 2. Span: (2 - 1) = 1 == (qty - 1) ──► Candidate Run [Seats 1, 2]
+• Evaluates Seat 3: end_seat = 4. Span: (4 - 3) = 1 == (qty - 1) ──► Candidate Run [Seats 3, 4]
+
+Handling Parallel Requests for 2 Adjacent Seats:
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1. Worker 1 locks candidate run [Seats 1, 2] via SELECT ... FOR UPDATE SKIP LOCKED          │
+│ 2. Worker 2 inspects [Seats 1, 2] -> Rows are locked -> SKIP LOCKED returns 0 rows          │
+│ 3. Worker 2 automatically advances loop to evaluate next run [Seats 3, 4]                   │
+│ 4. Worker 2 locks [Seats 3, 4] with zero wait time                                          │
+│ 5. Outcome: Both workers complete in < 5ms with zero seat collisions or partial allocations │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ```
 
