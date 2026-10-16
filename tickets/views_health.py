@@ -28,7 +28,7 @@ class LivenessProbeView(View):
 @method_decorator(csrf_exempt, name="dispatch")
 class ReadinessProbeView(View):
     """
-    Proves dependency health: pings PostgreSQL and Redis with strict timeouts.
+    Proves dependency health: pings PostgreSQL and Redis without multi-statement syntax errors.
     Returns HTTP 503 if connection pool starvation or broker partition occurs.
     """
 
@@ -37,11 +37,10 @@ class ReadinessProbeView(View):
         health_status = {"status": "ready", "checks": {}}
         all_healthy = True
 
-        # 1. PostgreSQL Connection & Pool Health Check
+        # 1. PostgreSQL Connection & Pool Health Check (single-statement query)
         try:
             with connection.cursor() as cursor:
-                # Fast timeout: do not let health checks queue behind heavy locks
-                cursor.execute("SET statement_timeout = '500ms'; SELECT 1;")
+                cursor.execute("SELECT 1;")
                 cursor.fetchone()
             health_status["checks"]["database"] = "ok"
         except Exception as e:
